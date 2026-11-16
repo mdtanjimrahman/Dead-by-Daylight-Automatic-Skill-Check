@@ -65,6 +65,10 @@ Possible outcomes:
 |:----------------------------:|:-----------------------------:|:--------------------------------:|:----------------------------------:|
 | ![Repair](images/repair.png) | ![Wiggle](images/wiggle.png)  | ![Struggle](images/struggle.png) | ![Merciless](images/merciless.png) |
 
+### Limitations
+
+- **The Doctor's Madness:** If the Killer has the Doctor's Madness effect active, the application may fail to detect skill checks correctly. This is because skill checks can appear at randomized positions on the screen rather than within the fixed 224×224 area monitored by the application. As a result, some skill checks may be missed.
+
 ### Dataset
 
 - Built from in-game recordings and YouTube gameplay
