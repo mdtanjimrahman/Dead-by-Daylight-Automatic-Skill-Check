@@ -1,5 +1,6 @@
 import json
 import math
+from time import monotonic
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -23,6 +24,8 @@ from dbd.utils.monitoring_mss import Monitoring_mss
 COMMUNITY_CAPTURE_NAME = "MSS"
 DEFAULT_VIEWPORT_WIDTH = 1400
 DEFAULT_VIEWPORT_HEIGHT = 950
+MIN_VIEWPORT_WIDTH = 360
+MIN_VIEWPORT_HEIGHT = 420
 UI_FONT_SIZE = 16
 HEADING_FONT_SIZE = 23
 FONTS_FOLDER = Path("fonts").resolve()
@@ -43,6 +46,8 @@ class AppSettings:
     thresh: int = DEFAULT_THRESHOLD
     thresh_frontier: int = DEFAULT_FRONTIER_THRESHOLD
     delay_frontier: int = DEFAULT_FRONTIER_HIT_DELAY
+    viewport_width: int = DEFAULT_VIEWPORT_WIDTH
+    viewport_height: int = DEFAULT_VIEWPORT_HEIGHT
 
 
 def _safe_score(score: Any) -> float:
@@ -95,20 +100,38 @@ def load_settings(config_path: Path = Path("settings.json")) -> AppSettings:
 class AutoSkillCheckApp:
     """Dear PyGui application for configuring and displaying skill-check monitoring."""
 
-    SETTINGS_PANEL_WIDTH = 650
-    HEADER_HEIGHT = 62
-    LIVE_METRICS_TABLE_HEIGHT = 300
-    LIVE_METRIC_CARD_HEIGHT = 280
-    CONFIGURATION_HEIGHT = 160
-    SELECTOR_WIDTH = 292
-    ACTION_BUTTON_WIDTH = 290
-    ACTION_BUTTON_HEIGHT = 44
+    # --- adaptive layout -------------------------------------------------
+    PADDING = 16
+    SPACING = 10
+    STACK_BREAKPOINT = 1000  # below this viewport width the panels stack vertically
+    FONT_TIERS = (0.85, 1.0, 1.2, 1.4)  # crisp pre-rasterised font sizes (multiples of the base size)
+    SETTINGS_MIN_WIDTH = 400
+    SETTINGS_MAX_WIDTH = 580
+    METRIC_CARD_MIN_WIDTH = 270  # two cards sit side by side only if both can be at least this wide
+    METRIC_CARD_CONTENT_HEIGHT = 240  # enough room for all inference metrics without inner scrolling
+    METRIC_CARD_FIXED_HEIGHT = 150  # padding/spacing that does not scale with the font
+    LOG_MIN_HEIGHT = 200
+    ACTION_BUTTON_WIDTH_MIN = 205
+    ACTION_BUTTON_HEIGHT = 46
+    FPS_BAR_HEIGHT = 20
+    SCORE_BAR_HEIGHT = 16
     MAX_EVENTS_PER_POLL = 100
     TELEMETRY_EVENT_TYPES = frozenset({"prediction", "fps"})
     ORDERED_EVENT_TYPES = frozenset({"startup", "running", "hit", "log", "finished"})
 
     WINDOW_TAG = "main_window"
+    HEADER_TAG = "header_panel"
+    PANELS_TAG = "panels_group"
+    SETTINGS_PANEL_TAG = "settings_panel"
+    LIVE_PANEL_TAG = "live_panel"
+    CARDS_GROUP_TAG = "metric_cards_group"
+    CONFIG_PANEL_TAG = "configuration_panel"
+    ACTION_GROUP_TAG = "action_buttons_group"
+    ACTION_SECTION_TAG = "action_buttons_section"
     TITLE_TAG = "app_title"
+    HEADER_LICENSE_TEXT_TAG = "header_license_text"
+    COMMUNITY_DETAILS_TEXT_TAG = "community_details_text"
+    COMMUNITY_LINK_TEXT_TAG = "community_link_text"
     SETUP_TITLE_TAG = "setup_title"
     LIVE_TITLE_TAG = "live_title"
     STATUS_DOT_TAG = "status_dot"
@@ -127,6 +150,7 @@ class AutoSkillCheckApp:
     DETECTION_TAG = "detection"
     INFERENCE_PANEL_TAG = "inference_panel"
     DETECTION_PANEL_TAG = "detection_panel"
+    SKILL_CHECK_COUNT_TAG = "skill_check_count"
     FPS_TAG = "fps"
     FPS_MARK_TAG = "fps_mark"
     FPS_BAR_TAG = "fps_bar"
@@ -139,12 +163,23 @@ class AutoSkillCheckApp:
     CONFIG_THRESH_TAG = "configuration_thresh"
     EMPTY_VALUE = "-"
 
-    TEXT = (230, 242, 246, 255)
-    MUTED = (145, 169, 181, 255)
-    ACCENT = (55, 205, 232, 255)
-    POSITIVE = (61, 220, 123, 255)
+    # --- red theme palette -----------------------------------------------
+    TEXT = (250, 243, 245, 255)
+    MUTED = (190, 169, 175, 255)
+    ACCENT = (255, 76, 99, 255)
+    ACCENT_HOVER = (255, 125, 145, 255)
+    ACCENT_DIM = (174, 39, 61, 255)
+    INFO = (88, 214, 222, 255)
+    POSITIVE = (72, 214, 130, 255)
     WARNING = (247, 190, 74, 255)
-    NEGATIVE = (255, 105, 125, 255)
+    ORANGE = (255, 150, 84, 255)
+    NEGATIVE = (255, 84, 76, 255)
+
+    WINDOW_BG = (10, 8, 11, 255)
+    PANEL_BG = (22, 15, 19, 255)
+    CARD_BG = (34, 22, 27, 255)
+    FRAME_BG = (44, 28, 34, 255)
+    BORDER = (91, 35, 49, 255)
 
     def __init__(
         self,
@@ -154,18 +189,27 @@ class AutoSkillCheckApp:
         self.dpg = dearpygui
         self.presets = presets or AppSettings()
         self.heading_font: Any = None
+        self.fonts: dict[float, tuple[Any, Any]] = {}
+        self.item_themes: dict[str, Any] = {}
         self.progress_themes: dict[tuple[int, int, int, int], Any] = {}
+        self.ui_scale = 1.0
+        self.scaled_heights: dict[str, int] = {}
+        self.viewport_size: tuple[int, int] | None = None
+        self.action_layout: tuple[int, float] | None = None
+        self._last_viewport_save_at = 0.0
+        self._last_saved_viewport_size: tuple[int, int] | None = None
         self.worker: Thread | None = None
         self.event_queue: EventQueue | None = None
         self.stop_event: Event | None = None
         self.worker_finished = False
+        self.skill_check_count = 0
 
     def _preset(self, name: str, default: Any = None) -> Any:
         value = getattr(self.presets, name, None)
         return default if value is None else value
 
     def _build_fonts(self, fonts_folder: Path = FONTS_FOLDER) -> None:
-        """Load the bundled UI font and its bold heading face when available."""
+        """Load the bundled UI font and its bold heading face at several crisp sizes."""
         regular_path = fonts_folder / "CascadiaCode" / "CaskaydiaCoveNerdFontMono-Regular.ttf"
         heading_path = fonts_folder / "CascadiaCode" / "CaskaydiaCoveNerdFontMono-Bold.ttf"
         if not regular_path.is_file():
@@ -173,72 +217,137 @@ class AutoSkillCheckApp:
 
         dpg = self.dpg
         with dpg.font_registry():
-            ui_font = dpg.add_font(str(regular_path), UI_FONT_SIZE)
-            if heading_path.is_file():
-                self.heading_font = dpg.add_font(str(heading_path), HEADING_FONT_SIZE)
-        dpg.bind_font(ui_font)
+            for tier in self.FONT_TIERS:
+                ui_font = dpg.add_font(str(regular_path), round(UI_FONT_SIZE * tier))
+                heading_font = dpg.add_font(str(heading_path), round(HEADING_FONT_SIZE * tier)) if heading_path.is_file() else None
+                self.fonts[tier] = (ui_font, heading_font)
+        base_ui_font, self.heading_font = self.fonts[1.0]
+        dpg.bind_font(base_ui_font)
 
     def _build_theme(self) -> None:
         dpg = self.dpg
         with dpg.theme() as theme:
             with dpg.theme_component(dpg.mvAll):
                 for color, value in (
-                    (dpg.mvThemeCol_WindowBg, (8, 13, 19, 255)),
-                    (dpg.mvThemeCol_ChildBg, (14, 24, 33, 255)),
-                    (dpg.mvThemeCol_PopupBg, (18, 31, 42, 255)),
-                    (dpg.mvThemeCol_FrameBg, (22, 39, 52, 255)),
-                    (dpg.mvThemeCol_FrameBgHovered, (29, 56, 70, 255)),
-                    (dpg.mvThemeCol_FrameBgActive, (35, 76, 92, 255)),
+                    (dpg.mvThemeCol_WindowBg, self.WINDOW_BG),
+                    (dpg.mvThemeCol_ChildBg, self.PANEL_BG),
+                    (dpg.mvThemeCol_PopupBg, (24, 16, 20, 252)),
+                    (dpg.mvThemeCol_FrameBg, self.FRAME_BG),
+                    (dpg.mvThemeCol_FrameBgHovered, (52, 33, 40, 255)),
+                    (dpg.mvThemeCol_FrameBgActive, (72, 40, 49, 255)),
                     (dpg.mvThemeCol_Text, self.TEXT),
                     (dpg.mvThemeCol_TextDisabled, self.MUTED),
-                    (dpg.mvThemeCol_Border, (42, 101, 122, 255)),
-                    (dpg.mvThemeCol_Separator, (35, 75, 89, 255)),
-                    (dpg.mvThemeCol_Header, (23, 53, 67, 255)),
-                    (dpg.mvThemeCol_HeaderHovered, (30, 72, 88, 255)),
-                    (dpg.mvThemeCol_HeaderActive, (36, 91, 108, 255)),
+                    (dpg.mvThemeCol_Border, self.BORDER),
+                    (dpg.mvThemeCol_Separator, (58, 26, 32, 255)),
+                    (dpg.mvThemeCol_Button, (62, 36, 43, 255)),
+                    (dpg.mvThemeCol_ButtonHovered, (96, 42, 54, 255)),
+                    (dpg.mvThemeCol_ButtonActive, (132, 38, 56, 255)),
+                    (dpg.mvThemeCol_Header, (48, 27, 34, 255)),
+                    (dpg.mvThemeCol_HeaderHovered, (84, 36, 47, 255)),
+                    (dpg.mvThemeCol_HeaderActive, (120, 38, 54, 255)),
                     (dpg.mvThemeCol_CheckMark, self.ACCENT),
                     (dpg.mvThemeCol_SliderGrab, self.ACCENT),
-                    (dpg.mvThemeCol_SliderGrabActive, (104, 229, 247, 255)),
-                    (dpg.mvThemeCol_ScrollbarBg, (10, 20, 28, 255)),
-                    (dpg.mvThemeCol_ScrollbarGrab, (55, 84, 98, 255)),
-                    (dpg.mvThemeCol_ScrollbarGrabHovered, (74, 119, 135, 255)),
+                    (dpg.mvThemeCol_SliderGrabActive, self.ACCENT_HOVER),
+                    (dpg.mvThemeCol_PlotHistogram, self.ACCENT),
+                    (dpg.mvThemeCol_TextSelectedBg, (150, 34, 52, 130)),
+                    (dpg.mvThemeCol_ScrollbarBg, (0, 0, 0, 0)),
+                    (dpg.mvThemeCol_ScrollbarGrab, (88, 46, 56, 255)),
+                    (dpg.mvThemeCol_ScrollbarGrabHovered, (130, 56, 70, 255)),
                     (dpg.mvThemeCol_ScrollbarGrabActive, self.ACCENT),
                 ):
                     dpg.add_theme_color(color, value)
                 for style, values in (
-                    (dpg.mvStyleVar_WindowRounding, (9,)),
-                    (dpg.mvStyleVar_ChildRounding, (7,)),
-                    (dpg.mvStyleVar_FrameRounding, (5,)),
-                    (dpg.mvStyleVar_GrabRounding, (5,)),
-                    (dpg.mvStyleVar_WindowPadding, (14, 12)),
-                    (dpg.mvStyleVar_FramePadding, (8, 5)),
-                    (dpg.mvStyleVar_ItemSpacing, (8, 7)),
-                    (dpg.mvStyleVar_ItemInnerSpacing, (7, 4)),
+                    (dpg.mvStyleVar_WindowRounding, (12,)),
+                    (dpg.mvStyleVar_ChildRounding, (12,)),
+                    (dpg.mvStyleVar_PopupRounding, (10,)),
+                    (dpg.mvStyleVar_FrameRounding, (8,)),
+                    (dpg.mvStyleVar_GrabRounding, (8,)),
+                    (dpg.mvStyleVar_ScrollbarRounding, (10,)),
+                    (dpg.mvStyleVar_ScrollbarSize, (10,)),
+                    (dpg.mvStyleVar_GrabMinSize, (16,)),
+                    (dpg.mvStyleVar_WindowPadding, (self.PADDING, self.PADDING - 3)),
+                    (dpg.mvStyleVar_FramePadding, (10, 7)),
+                    (dpg.mvStyleVar_ItemSpacing, (self.SPACING, 7)),
+                    (dpg.mvStyleVar_ItemInnerSpacing, (8, 5)),
                     (dpg.mvStyleVar_WindowBorderSize, (0,)),
                     (dpg.mvStyleVar_ChildBorderSize, (1,)),
+                    (dpg.mvStyleVar_PopupBorderSize, (1,)),
                     (dpg.mvStyleVar_FrameBorderSize, (0,)),
                 ):
                     dpg.add_theme_style(style, *values)
-            with dpg.theme_component(dpg.mvButton):
-                for color, value in (
-                    (dpg.mvThemeCol_Button, (20, 117, 143, 255)),
-                    (dpg.mvThemeCol_ButtonHovered, (29, 157, 183, 255)),
-                    (dpg.mvThemeCol_ButtonActive, (17, 91, 113, 255)),
-                ):
-                    dpg.add_theme_color(color, value)
-            with dpg.theme_component(dpg.mvInputText):
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (12, 22, 30, 255))
         dpg.bind_theme(theme)
+
+        def child_theme(background: tuple[int, int, int, int], border: tuple[int, int, int, int], rounding: int) -> Any:
+            with dpg.theme() as item_theme, dpg.theme_component(dpg.mvChildWindow):
+                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, background)
+                dpg.add_theme_color(dpg.mvThemeCol_Border, border)
+                dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, rounding)
+            return item_theme
+
+        def button_theme(
+            normal: tuple[int, int, int, int],
+            hovered: tuple[int, int, int, int],
+            active: tuple[int, int, int, int],
+            border: tuple[int, int, int, int] | None = None,
+        ) -> Any:
+            with dpg.theme() as item_theme:
+                with dpg.theme_component(dpg.mvButton):
+                    dpg.add_theme_color(dpg.mvThemeCol_Button, normal)
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, hovered)
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, active)
+                    dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 10)
+                    if border is not None:
+                        dpg.add_theme_color(dpg.mvThemeCol_Border, border)
+                        dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
+                with dpg.theme_component(dpg.mvButton, enabled_state=False):
+                    dpg.add_theme_color(dpg.mvThemeCol_Button, (30, 21, 25, 255))
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (30, 21, 25, 255))
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (30, 21, 25, 255))
+                    dpg.add_theme_color(dpg.mvThemeCol_Text, (112, 92, 97, 255))
+                    dpg.add_theme_color(dpg.mvThemeCol_Border, (46, 24, 29, 255))
+            return item_theme
+
+        with dpg.theme() as help_theme, dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (58, 28, 36, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, self.ACCENT_DIM)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, self.ACCENT)
+            dpg.add_theme_color(dpg.mvThemeCol_Text, self.ACCENT_HOVER)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 12)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 7, 1)
+
+        with dpg.theme() as log_theme, dpg.theme_component(dpg.mvChildWindow):
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (15, 10, 13, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_Border, (52, 24, 30, 255))
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 10)
+
+        self.item_themes = {
+            "panel": child_theme(self.PANEL_BG, self.BORDER, 14),
+            "header": child_theme((24, 12, 16, 255), self.ACCENT_DIM, 14),
+            "card": child_theme(self.CARD_BG, (74, 31, 39, 255), 10),
+            "log": log_theme,
+            "primary_button": button_theme((200, 36, 60, 255), (232, 62, 86, 255), (150, 26, 46, 255)),
+            "secondary_button": button_theme((66, 34, 42, 255), (104, 40, 54, 255), (140, 36, 56, 255), border=(120, 40, 54, 255)),
+            "help": help_theme,
+        }
+
         self.progress_themes = {}
-        for color in (self.NEGATIVE, (255, 153, 102, 255), self.WARNING, self.POSITIVE, self.ACCENT, self.MUTED):
+        for color in (self.NEGATIVE, self.ORANGE, self.WARNING, self.POSITIVE, self.ACCENT, self.INFO, self.MUTED):
             with dpg.theme() as progress_theme, dpg.theme_component(dpg.mvProgressBar):
                 dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, color)
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (45, 31, 37, 255))
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 8)
             self.progress_themes[color] = progress_theme
+
+    def _style(self, item: Any, key: str) -> None:
+        """Bind one of the prepared item themes (no-op when themes were not built)."""
+        theme = self.item_themes.get(key)
+        if theme is not None:
+            self.dpg.bind_item_theme(item, theme)
 
     def _set_status(self, status: str) -> None:
         status_color = {
             self.STATUS_WAITING: self.WARNING,
-            self.STATUS_STARTING: self.ACCENT,
+            self.STATUS_STARTING: self.INFO,
             self.STATUS_RUNNING: self.POSITIVE,
             self.STATUS_STOPPING: self.WARNING,
             self.STATUS_STOPPED: self.NEGATIVE,
@@ -284,6 +393,7 @@ class AutoSkillCheckApp:
                 line,
                 parent=self.LOG_TAG,
                 color=colors[level],
+                wrap=0,
             )
             self._scroll_log_to_bottom()
         else:
@@ -409,11 +519,13 @@ class AutoSkillCheckApp:
         if configuration is None:
             return
 
-        self._start_worker(
+        if self._start_worker(
             run_monitoring_with_callbacks,
             {"configuration": configuration},
             "Monitoring started.",
-        )
+        ):
+            self.skill_check_count = 0
+            self.dpg.set_value(self.SKILL_CHECK_COUNT_TAG, "0")
 
     def _stop(self, *_args: Any) -> None:
         status = self.dpg.get_value(self.STATUS_TAG)
@@ -441,13 +553,13 @@ class AutoSkillCheckApp:
                 color
                 for limit, color in (
                     (40, self.NEGATIVE),
-                    (60, (255, 153, 102, 255)),
+                    (60, self.ORANGE),
                     (80, self.WARNING),
                     (110, self.POSITIVE),
                 )
                 if fps_value < limit
             ),
-            self.ACCENT,
+            self.INFO,
         )
         self.dpg.set_value(self.FPS_TAG, f"{fps_value:.0f} FPS")
         self.dpg.set_value(self.FPS_BAR_TAG, min(fps_value, 120) / 120)
@@ -535,6 +647,8 @@ class AutoSkillCheckApp:
             return
         desc = str(hit.get("desc", "Skill check"))
         confidence = hit.get("confidence", 0)
+        self.skill_check_count += 1
+        self.dpg.set_value(self.SKILL_CHECK_COUNT_TAG, str(self.skill_check_count))
         self._append_log(f"{desc.upper()} hit at {confidence}% confidence", "info")
 
     def _handle_finished(self, _event: WorkerEvent) -> None:
@@ -606,8 +720,12 @@ class AutoSkillCheckApp:
     def _add_help_marker(self, message: str) -> None:
         dpg = self.dpg
         help_button = dpg.add_button(label="?", small=True)
+        self._style(help_button, "help")
         with dpg.tooltip(help_button):
-            dpg.add_text(message, wrap=420)
+            dpg.add_text(message, wrap=360)
+
+    def _add_section_title(self, text: str) -> None:
+        self.dpg.add_text(text, color=self.ACCENT)
 
     def _add_labeled_slider(
         self,
@@ -631,37 +749,37 @@ class AutoSkillCheckApp:
 
     def _build_header(self) -> None:
         dpg = self.dpg
-        with dpg.child_window(width=-1, height=self.HEADER_HEIGHT, border=True), dpg.group(horizontal=True):
+        with dpg.child_window(tag=self.HEADER_TAG, width=-1, auto_resize_y=True, border=True, horizontal_scrollbar=False):
             dpg.add_text("DBD AUTO SKILL CHECK — COMMUNITY", tag=self.TITLE_TAG, color=self.ACCENT)
-            dpg.add_spacer(width=-1)
-            dpg.add_text(
-                "Reuse or redistribution: credit https://github.com/Manuteaa/dbd_autoSkillCheck.\n"
-                "Follow GPLv3: include the license and provide corresponding source.",
-                color=self.TEXT,
-            )
+            with dpg.collapsing_header(label="Community information & license", default_open=False):
+                dpg.add_text(
+                    "Reuse or redistribution: credit https://github.com/Manuteaa/dbd_autoSkillCheck. "
+                    "Follow GPLv3: include the license and provide corresponding source.",
+                    tag=self.HEADER_LICENSE_TEXT_TAG,
+                    color=self.MUTED,
+                    wrap=420,
+                )
+        self._style(self.HEADER_TAG, "header")
 
     def _build_capture_settings(self) -> None:
         dpg = self.dpg
-        dpg.add_spacer(height=6)
+        dpg.add_spacer(height=4)
         dpg.add_separator()
-        dpg.add_text("SCREEN CAPTURE", color=self.ACCENT)
+        self._add_section_title("SCREEN CAPTURE")
         with dpg.group(horizontal=True):
-            with dpg.group():
-                with dpg.group(horizontal=True):
-                    dpg.add_text("SOURCE", color=self.MUTED)
-                    self._add_help_marker(
-                        "The community edition uses MSS to capture a 224x224 crop from the center of the selected display."
-                        "\n\nOn Linux, launch the application from an X11/XWayland session where DISPLAY is set.",
-                    )
-                dpg.add_text(COMMUNITY_CAPTURE_NAME, color=self.TEXT)
-            dpg.add_spacer(width=10)
-            with dpg.group():
-                dpg.add_text("DISPLAY", color=self.MUTED)
-                dpg.add_combo(items=[], tag=self.MONITOR_TAG, width=self.SELECTOR_WIDTH)
+            dpg.add_text("SOURCE", color=self.MUTED)
+            self._add_help_marker(
+                "The community edition uses MSS to capture a 224x224 crop from the center of the selected display."
+                "\n\nOn Linux, launch the application from an X11/XWayland session where DISPLAY is set.",
+            )
+            dpg.add_spacer(width=6)
+            dpg.add_text(COMMUNITY_CAPTURE_NAME, color=self.TEXT)
+        dpg.add_text("DISPLAY", color=self.MUTED)
+        dpg.add_combo(items=[], tag=self.MONITOR_TAG, width=-1)
 
     def _build_additional_ai_settings(self) -> None:
         dpg = self.dpg
-        dpg.add_spacer(height=6)
+        dpg.add_spacer(height=4)
         dpg.add_separator()
         with dpg.collapsing_header(label="Additional AI Settings", default_open=False):
             for label, minimum, maximum, default, tag, help_text in (
@@ -695,30 +813,34 @@ class AutoSkillCheckApp:
 
     def _build_action_buttons(self) -> None:
         dpg = self.dpg
-        dpg.add_spacer(height=8)
-        dpg.add_separator()
-        with dpg.group(horizontal=True):
-            for index, (label, tag, callback, enabled) in enumerate(
-                (
-                    ("▶  START MONITORING", self.RUN_TAG, self._run, True),
-                    ("■  STOP MONITORING", self.STOP_TAG, self._stop, False),
-                ),
-            ):
-                if index:
-                    dpg.add_spacer(width=12)
-                dpg.add_button(
-                    label=label,
-                    tag=tag,
-                    callback=callback,
-                    width=self.ACTION_BUTTON_WIDTH,
-                    height=self.ACTION_BUTTON_HEIGHT,
-                    enabled=enabled,
-                )
+        # Keep divider, spacing, and buttons together so whole section can move
+        # above LIVE MONITOR in compact stacked layout.
+        with dpg.group(tag=self.ACTION_SECTION_TAG, horizontal=False):
+            dpg.add_spacer(height=6)
+            dpg.add_separator()
+            dpg.add_spacer(height=2)
+            with dpg.group(tag=self.ACTION_GROUP_TAG, horizontal=True):
+                for label, tag, callback, enabled, style in (
+                    ("▶  START MONITORING", self.RUN_TAG, self._run, True, "primary_button"),
+                    ("■  STOP MONITORING", self.STOP_TAG, self._stop, False, "secondary_button"),
+                ):
+                    dpg.add_button(
+                        label=label,
+                        tag=tag,
+                        callback=callback,
+                        width=-1,
+                        height=self.ACTION_BUTTON_HEIGHT,
+                        enabled=enabled,
+                    )
+                    self._style(tag, style)
+        self.scaled_heights[self.RUN_TAG] = self.ACTION_BUTTON_HEIGHT
+        self.scaled_heights[self.STOP_TAG] = self.ACTION_BUTTON_HEIGHT
 
     def _build_settings_panel(self) -> None:
         dpg = self.dpg
         with dpg.child_window(
-            width=self.SETTINGS_PANEL_WIDTH,
+            tag=self.SETTINGS_PANEL_TAG,
+            width=self.SETTINGS_MAX_WIDTH,
             height=-1,
             border=True,
             horizontal_scrollbar=False,
@@ -727,52 +849,63 @@ class AutoSkillCheckApp:
                 dpg.add_text("SETTINGS", tag=self.SETUP_TITLE_TAG, color=self.ACCENT)
                 self._add_help_marker(
                     "Default values are loaded from settings.json when the application starts.\n"
-                    "Edit that file before launch to keep your preferred settings. "
+                    "Edit that file before launch to keep your preferred settings. ",
                 )
-            dpg.add_text(
-                "This is the limited community version of DBD Auto Skill Check.",
-                color=self.WARNING,
-                wrap=600,
-            )
-            dpg.add_text(
-                "The complete version is available through the Discord server after accepting the fair-use agreement.",
-                color=self.TEXT,
-                wrap=600,
-            )
-            dpg.add_text("https://discord.gg/3mewehHHpZ", color=self.ACCENT)
-            dpg.add_spacer(height=8)
+            with dpg.collapsing_header(label="Community edition details", default_open=False):
+                dpg.add_text(
+                    "This is the limited community version of DBD Auto Skill Check. "
+                    "Complete version available through Discord after accepting fair-use agreement.",
+                    tag=self.COMMUNITY_DETAILS_TEXT_TAG,
+                    color=self.MUTED,
+                    wrap=360,
+                )
+                dpg.add_text(
+                    "https://discord.gg/3mewehHHpZ",
+                    tag=self.COMMUNITY_LINK_TEXT_TAG,
+                    color=self.ACCENT_HOVER,
+                    wrap=360,
+                )
+            dpg.add_spacer(height=4)
             self._build_capture_settings()
             self._build_additional_ai_settings()
             self._build_action_buttons()
+        self._style(self.SETTINGS_PANEL_TAG, "panel")
 
     def _build_inference_card(self) -> None:
         dpg = self.dpg
         with dpg.child_window(
             tag=self.INFERENCE_PANEL_TAG,
             width=-1,
-            height=self.LIVE_METRIC_CARD_HEIGHT,
+            height=0,
+            auto_resize_y=True,
             border=True,
             horizontal_scrollbar=False,
         ):
-            dpg.add_text("AI INFERENCE PERFORMANCE", tag=self.SIGNAL_LOGO_TAG, color=self.ACCENT)
-            dpg.add_spacer(height=8)
+            dpg.add_text("AI INFERENCE PERFORMANCE", tag=self.SIGNAL_LOGO_TAG, color=self.ACCENT, wrap=0)
+            dpg.add_spacer(height=4)
             with dpg.group(horizontal=True):
                 dpg.add_text("●", tag=self.STATUS_DOT_TAG, color=self.WARNING)
                 dpg.add_text("MONITOR STATUS", color=self.MUTED)
             dpg.add_text(self.STATUS_WAITING, tag=self.STATUS_TAG, color=self.WARNING)
-            dpg.add_spacer(height=14)
+            dpg.add_spacer(height=5)
+            dpg.add_text("SKILL CHECKS APPEARED", tag="skill_check_count_label", color=self.ACCENT_HOVER)
+            dpg.add_text("0", tag=self.SKILL_CHECK_COUNT_TAG, color=self.ACCENT_HOVER)
+            dpg.add_spacer(height=5)
             with dpg.group(horizontal=True):
-                dpg.add_text("↯", tag=self.FPS_MARK_TAG, color=self.ACCENT)
+                dpg.add_text("↯", tag=self.FPS_MARK_TAG, color=self.INFO)
                 dpg.add_text("CURRENT INFERENCE FPS", color=self.MUTED)
-            dpg.add_text("0 FPS", tag=self.FPS_TAG, color=self.ACCENT)
-            dpg.add_progress_bar(default_value=0.0, tag=self.FPS_BAR_TAG, width=-1, height=20, overlay="0 FPS")
+            dpg.add_text("0 FPS", tag=self.FPS_TAG, color=self.INFO)
+            dpg.add_progress_bar(default_value=0.0, tag=self.FPS_BAR_TAG, width=-1, height=self.FPS_BAR_HEIGHT, overlay="0 FPS")
+        self._style(self.INFERENCE_PANEL_TAG, "card")
+        self.scaled_heights[self.FPS_BAR_TAG] = self.FPS_BAR_HEIGHT
 
     def _build_detection_card(self) -> None:
         dpg = self.dpg
         with dpg.child_window(
             tag=self.DETECTION_PANEL_TAG,
             width=-1,
-            height=self.LIVE_METRIC_CARD_HEIGHT,
+            height=0,
+            auto_resize_y=True,
             border=True,
             horizontal_scrollbar=False,
         ):
@@ -782,8 +915,8 @@ class AutoSkillCheckApp:
                     "For best results, run the game and AI at 120 FPS or higher and set your monitor to at least 120 Hz.\n\n"
                     "Fine-tune the AI settings if needed. If you have trouble, visit the Discord server for help.",
                 )
-            dpg.add_spacer(height=8)
-            dpg.add_text(self.EMPTY_VALUE, tag=self.DETECTION_TAG, color=self.MUTED, wrap=420)
+            dpg.add_spacer(height=2)
+            dpg.add_text(self.EMPTY_VALUE, tag=self.DETECTION_TAG, color=self.MUTED, wrap=0)
             with dpg.table(
                 header_row=False,
                 policy=dpg.mvTable_SizingStretchProp,
@@ -803,15 +936,17 @@ class AutoSkillCheckApp:
                             default_value=0.0,
                             tag=f"inference_score_{key}",
                             width=-1,
-                            height=16,
+                            height=self.SCORE_BAR_HEIGHT,
                             overlay="0%",
                         )
+                    self.scaled_heights[f"inference_score_{key}"] = self.SCORE_BAR_HEIGHT
+        self._style(self.DETECTION_PANEL_TAG, "card")
 
     def _build_configuration_card(self) -> None:
         dpg = self.dpg
         dpg.add_text("ACTIVE CONFIGURATION", color=self.ACCENT)
         with (
-            dpg.child_window(height=self.CONFIGURATION_HEIGHT, border=True, horizontal_scrollbar=False),
+            dpg.child_window(tag=self.CONFIG_PANEL_TAG, width=-1, auto_resize_y=True, border=True, horizontal_scrollbar=False),
             dpg.table(
                 header_row=False,
                 policy=dpg.mvTable_SizingStretchSame,
@@ -833,40 +968,31 @@ class AutoSkillCheckApp:
                     for title, tag in row:
                         with dpg.group():
                             dpg.add_text(title, color=self.ACCENT)
-                            dpg.add_text(self.EMPTY_VALUE, tag=tag, color=self.MUTED, wrap=290)
+                            dpg.add_text(self.EMPTY_VALUE, tag=tag, color=self.TEXT, wrap=0)
+        self._style(self.CONFIG_PANEL_TAG, "card")
 
     def _build_activity_log(self) -> None:
         self.dpg.add_text("RECENT ACTIVITIES", color=self.MUTED)
-        with self.dpg.child_window(tag=self.LOG_TAG, height=-1, border=False, horizontal_scrollbar=False):
+        with self.dpg.child_window(tag=self.LOG_TAG, height=-1, border=True, horizontal_scrollbar=False):
             pass
+        self._style(self.LOG_TAG, "log")
 
     def _build_live_panel(self) -> None:
         dpg = self.dpg
-        with dpg.child_window(width=-1, height=-1, border=True, horizontal_scrollbar=False):
+        with dpg.child_window(tag=self.LIVE_PANEL_TAG, width=-1, height=-1, border=True, horizontal_scrollbar=False):
             dpg.add_text("LIVE MONITOR", tag=self.LIVE_TITLE_TAG, color=self.ACCENT)
-            with dpg.table(
-                header_row=False,
-                policy=dpg.mvTable_SizingStretchSame,
-                width=-1,
-                height=self.LIVE_METRICS_TABLE_HEIGHT,
-                inner_width=8,
-                borders_innerH=False,
-                borders_outerH=False,
-                borders_innerV=False,
-                borders_outerV=False,
-            ):
-                dpg.add_table_column()
-                dpg.add_table_column()
-                with dpg.table_row():
-                    self._build_inference_card()
-                    self._build_detection_card()
-            dpg.add_spacer(height=10)
+            with dpg.group(tag=self.CARDS_GROUP_TAG, horizontal=True):
+                self._build_inference_card()
+                self._build_detection_card()
+            dpg.add_spacer(height=4)
             self._build_configuration_card()
-            dpg.add_spacer(height=6)
+            dpg.add_spacer(height=2)
             self._build_activity_log()
+        self._style(self.LIVE_PANEL_TAG, "panel")
 
     def _bind_heading_fonts(self) -> None:
-        if self.heading_font is None:
+        heading_font = self.fonts.get(self.ui_scale, (None, self.heading_font))[1]
+        if heading_font is None:
             return
         does_item_exist = getattr(self.dpg, "does_item_exist", None)
         for tag in (
@@ -878,16 +1004,21 @@ class AutoSkillCheckApp:
             self.STATUS_TAG,
             self.FPS_TAG,
             self.DETECTION_TAG,
+            self.SKILL_CHECK_COUNT_TAG,
+            "skill_check_count_label",
+            self.CONFIG_MODEL_TAG,
+            self.CONFIG_DEVICE_TAG,
+            self.CONFIG_CAPTURE_TAG,
+            self.CONFIG_THRESH_TAG,
         ):
             if callable(does_item_exist) and not does_item_exist(tag):
                 continue
-            self.dpg.bind_item_font(tag, self.heading_font)
+            self.dpg.bind_item_font(tag, heading_font)
 
     def _build_window(self) -> None:
         with self.dpg.window(tag=self.WINDOW_TAG, label="DBD ASC", no_collapse=True):
             self._build_header()
-            self.dpg.add_separator()
-            with self.dpg.group(horizontal=True):
+            with self.dpg.group(tag=self.PANELS_TAG, horizontal=True):
                 self._build_settings_panel()
                 self._build_live_panel()
 
@@ -896,6 +1027,162 @@ class AutoSkillCheckApp:
         self._update_fps_display(0)
         self._update_inference_score_display(None)
 
+    # ------------------------------------------------------------------
+    # Adaptive layout
+    # ------------------------------------------------------------------
+    def _set_ui_scale(self, scale: float) -> None:
+        """Switch to one of the pre-rasterised font tiers and rescale fixed-height widgets."""
+        dpg = self.dpg
+        self.ui_scale = scale
+        ui_font, _heading_font = self.fonts.get(scale, (None, None))
+        if ui_font is not None:
+            dpg.bind_font(ui_font)
+            self._bind_heading_fonts()
+        else:
+            dpg.set_global_font_scale(scale)
+        for tag, base_height in self.scaled_heights.items():
+            dpg.configure_item(tag, height=round(base_height * scale))
+
+    def _metric_card_height(self, scale: float) -> int:
+        return round(self.METRIC_CARD_CONTENT_HEIGHT * scale + self.METRIC_CARD_FIXED_HEIGHT)
+
+    def _apply_layout(self, width: int, height: int) -> None:
+        """Pick one- or two-column layout and size every panel for the current viewport."""
+        dpg = self.dpg
+        stacked = width < self.STACK_BREAKPOINT
+        basis = width / 900 if stacked else min(width / DEFAULT_VIEWPORT_WIDTH, height / 880)
+        scale = min(self.FONT_TIERS, key=lambda tier: abs(tier - basis))
+        if scale != self.ui_scale or self.viewport_size is None:
+            self._set_ui_scale(scale)
+
+        dpg.configure_item(self.PANELS_TAG, horizontal=not stacked)
+        # On compact windows, put live monitoring first so key information stays visible.
+        if stacked:
+            dpg.move_item(self.LIVE_PANEL_TAG, parent=self.PANELS_TAG, before=self.SETTINGS_PANEL_TAG)
+            # Put monitoring controls immediately above LIVE MONITOR heading.
+            dpg.move_item(self.ACTION_SECTION_TAG, parent=self.LIVE_PANEL_TAG, before=self.LIVE_TITLE_TAG)
+        else:
+            dpg.move_item(self.SETTINGS_PANEL_TAG, parent=self.PANELS_TAG, before=self.LIVE_PANEL_TAG)
+            # Restore controls to bottom of Settings in desktop two-column layout.
+            dpg.move_item(self.ACTION_SECTION_TAG, parent=self.SETTINGS_PANEL_TAG)
+        log_height = round(self.LOG_MIN_HEIGHT * scale)
+        if stacked:
+            for panel in (self.SETTINGS_PANEL_TAG, self.LIVE_PANEL_TAG):
+                dpg.configure_item(panel, width=-1, auto_resize_y=True, height=0)
+            dpg.configure_item(self.LOG_TAG, height=max(110, round(log_height * 0.65)))
+            live_inner = width - 4 * self.PADDING
+        else:
+            settings_width = round(min(max(width * 0.36, self.SETTINGS_MIN_WIDTH * scale), self.SETTINGS_MAX_WIDTH * scale))
+            dpg.configure_item(self.SETTINGS_PANEL_TAG, width=settings_width, auto_resize_y=False, height=-1)
+            dpg.configure_item(self.LIVE_PANEL_TAG, width=-1, auto_resize_y=False, height=-1)
+            dpg.configure_item(self.LOG_TAG, height=-1)
+            live_inner = width - settings_width - 4 * self.PADDING - self.SPACING
+
+        side_by_side = live_inner >= (2 * self.METRIC_CARD_MIN_WIDTH + self.SPACING) * scale
+        dpg.configure_item(self.CARDS_GROUP_TAG, horizontal=side_by_side)
+        if side_by_side:
+            # Equal fixed heights keep card bottoms aligned in wide layouts.
+            # Height is deliberately larger than previous fixed size so inference
+            # metrics fit without introducing an inner vertical scrollbar.
+            card_height = max(self._metric_card_height(scale), round(390 * scale))
+            dpg.configure_item(
+                self.INFERENCE_PANEL_TAG,
+                width=round((live_inner - self.SPACING) / 2),
+                auto_resize_y=False,
+                height=card_height,
+            )
+            dpg.configure_item(
+                self.DETECTION_PANEL_TAG,
+                width=-1,
+                auto_resize_y=False,
+                height=card_height,
+            )
+        else:
+            # Narrow layouts retain natural content height and stack vertically.
+            for card in (self.INFERENCE_PANEL_TAG, self.DETECTION_PANEL_TAG):
+                dpg.configure_item(card, width=-1, auto_resize_y=True, height=0)
+        self.action_layout = None  # re-fit the Start/Stop buttons against the new panel width
+
+    def _fit_action_buttons(self) -> None:
+        """Place Start/Stop side by side when they fit, otherwise stack them full-width."""
+        dpg = self.dpg
+        available = dpg.get_item_rect_size(self.MONITOR_TAG)[0]
+        if available <= 0:
+            return
+        side_by_side = (available - self.SPACING) / 2 >= self.ACTION_BUTTON_WIDTH_MIN * self.ui_scale
+        layout = (round(available), side_by_side)
+        if layout == self.action_layout:
+            return
+        self.action_layout = layout
+        dpg.configure_item(self.ACTION_GROUP_TAG, horizontal=side_by_side)
+        if side_by_side:
+            half = int((available - self.SPACING) // 2)
+            dpg.configure_item(self.RUN_TAG, width=half)
+            dpg.configure_item(self.STOP_TAG, width=-1)
+        else:
+            dpg.configure_item(self.RUN_TAG, width=-1)
+            dpg.configure_item(self.STOP_TAG, width=-1)
+
+    def _fit_explanatory_text(self) -> None:
+        """Wrap long explanatory copy to available panel width, never to 1 pixel."""
+        dpg = self.dpg
+        for parent_tag, text_tags, inset in (
+            (self.HEADER_TAG, (self.HEADER_LICENSE_TEXT_TAG,), 36),
+            (
+                self.SETTINGS_PANEL_TAG,
+                (self.COMMUNITY_DETAILS_TEXT_TAG, self.COMMUNITY_LINK_TEXT_TAG),
+                34,
+            ),
+        ):
+            try:
+                parent_width = dpg.get_item_rect_size(parent_tag)[0]
+            except (SystemError, RuntimeError, TypeError):
+                continue
+            if parent_width <= 0:
+                continue
+            wrap_width = max(140, int(parent_width - inset))
+            for text_tag in text_tags:
+                if dpg.does_item_exist(text_tag):
+                    dpg.configure_item(text_tag, wrap=wrap_width)
+
+    def _update_layout(self) -> None:
+        dpg = self.dpg
+        size = (dpg.get_viewport_client_width(), dpg.get_viewport_client_height())
+        if size != self.viewport_size and size[0] > 0 and size[1] > 0:
+            self._apply_layout(*size)
+            self.viewport_size = size
+            self._fit_explanatory_text()
+            now = monotonic()
+            if now - self._last_viewport_save_at >= 1.0:
+                self._save_viewport_size()
+                self._last_viewport_save_at = now
+        self._fit_action_buttons()
+
+    def _save_viewport_size(self) -> None:
+        """Persist last window dimensions without overwriting other settings."""
+        try:
+            width = int(self.dpg.get_viewport_width())
+            height = int(self.dpg.get_viewport_height())
+            if width < MIN_VIEWPORT_WIDTH or height < MIN_VIEWPORT_HEIGHT:
+                return
+            config_path = Path("settings.json")
+            try:
+                with config_path.open(encoding="utf-8") as config_file:
+                    saved = json.load(config_file)
+                if not isinstance(saved, dict):
+                    saved = {}
+            except (json.JSONDecodeError, OSError):
+                saved = {}
+            saved["viewport_width"] = width
+            saved["viewport_height"] = height
+            temporary_path = config_path.with_suffix(".json.tmp")
+            temporary_path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+            temporary_path.replace(config_path)
+            self._last_saved_viewport_size = (width, height)
+        except (OSError, TypeError, ValueError):
+            # Window-size persistence must never prevent application shutdown.
+            pass
+
     def run(self, *_args: Any) -> None:
         dpg = self.dpg
         dpg.create_context()
@@ -903,19 +1190,31 @@ class AutoSkillCheckApp:
             self._build_fonts()
             self._build_theme()
             self._build_window()
+            try:
+                saved_width = int(self._preset("viewport_width", DEFAULT_VIEWPORT_WIDTH))
+            except (TypeError, ValueError):
+                saved_width = DEFAULT_VIEWPORT_WIDTH
+            try:
+                saved_height = int(self._preset("viewport_height", DEFAULT_VIEWPORT_HEIGHT))
+            except (TypeError, ValueError):
+                saved_height = DEFAULT_VIEWPORT_HEIGHT
             dpg.create_viewport(
                 title="DBD ASC COMMUNITY",
-                width=DEFAULT_VIEWPORT_WIDTH,
-                height=DEFAULT_VIEWPORT_HEIGHT,
+                width=max(MIN_VIEWPORT_WIDTH, saved_width),
+                height=max(MIN_VIEWPORT_HEIGHT, saved_height),
+                min_width=MIN_VIEWPORT_WIDTH,
+                min_height=MIN_VIEWPORT_HEIGHT,
                 resizable=True,
             )
             dpg.setup_dearpygui()
             dpg.show_viewport()
             dpg.set_primary_window(self.WINDOW_TAG, True)
             while dpg.is_dearpygui_running():
+                self._update_layout()
                 self._poll_events()
                 dpg.render_dearpygui_frame()
         finally:
+            self._save_viewport_size()
             self._shutdown_worker()
             dpg.destroy_context()
 
