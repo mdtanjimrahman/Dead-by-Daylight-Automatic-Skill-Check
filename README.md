@@ -2,7 +2,7 @@
 
 _Dead by Daylight Automatic Skill Check_ is an AI research project that detects and automatically hits great skill checks most of the time in Dead by Daylight using trained supervised AI model.
 
-This application provides an responsive desktop interface (GUI) for configuring and running AI model **on your computer** locally (no internet). While active, it monitors a small area of the screen (224x224 area) and automatically presses the space bar when it detects a great skill check. For best results, keep the minimum game **FPS 90** or above.
+This application provides an responsive desktop interface (GUI) for configuring and running AI model **on your computer** locally (no internet). While active, it monitors a small area of the screen (224x224 area) and automatically presses the space bar when it detects a great skill check.
 
 The project uses PyTorch for training and ONNX Runtime for real-time inference, with CPU support (GPU is not mandatory). It demonstrates how computer vision models can operate within the latency constraints of a multiplayer game.
 
@@ -29,24 +29,28 @@ The project uses PyTorch for training and ONNX Runtime for real-time inference, 
 
 This is the recommended option. It does not require Python knowledge.
 
-1. Go to the [releases page](https://github.com/Manuteaa/dbd_autoSkillCheck/releases) and open the latest release. It is a minimal package to run the app.
-2. Download and extract `DBD-ASC-V4.0-GH.zip`.
-3. Double-click `run_app.bat`. You may ignore the Windows warning related to "unknown publisher".
+1. Go to the [releases page](https://github.com/mdtanjimrahman/Dead-by-Daylight-Automatic-Skill-Check/releases) and open the latest release. It is a minimal package to run the app.
+2. Download and run `DBD-ASC-Setup.exe`.
+3. Keep an active **Internet** connection while running the installation process.
+4. Must check either create desktop or start menu shortcut. You may ignore the Windows warning related to "unknown publisher".
 
 ### Build from source
 
-Choose this option if you are familiar with Python and want to customize the code.
+Choose this option if you are familiar with Python and want to customize the code. (Windows only instructions)
 
-1. Create a Python 3.12 environment.
-2. Clone the repository.
-3. Install the minimum dependencies:
-
-   ```text
-   dearpygui mss numpy Pillow pynput onnxruntime
+1. Clone the repository.
+2. Install **PyEnv** and install _3.12.0_ with `pyenv install 3.12.0`
+3. Go to the project's root directory, open cmd/terminal, and create a Python 3.12 environment by running:
+   ```bash
+   pyenv local 3.12.0
+   python -m venv .venv
    ```
-
-
-4. Run `dbd/app.py` to start the application.
+4. Activate the Python 3.12 local environment by running `.\.venv\Scripts\activate`
+5. Install the minimum dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+6. Run `python great_patch.py` to start the application and keep the terminal open.
 
 
 ## Project details
