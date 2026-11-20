@@ -2,7 +2,7 @@
 
 _Dead by Daylight Automatic Skill Check_ is an AI research project that detects and automatically hits great skill checks most of the time in Dead by Daylight using trained supervised AI model.
 
-This application provides an responsive desktop interface (GUI) for configuring and running AI model **on your computer** locally (no internet). While active, it monitors a small area of the screen (224x224 area) and automatically presses the space bar when it detects a great skill check.
+This application provides an responsive desktop interface (GUI) for configuring and running AI model **on your computer** locally (no internet). While active, it monitors a small area of the screen (224x224 area) and automatically presses the space bar when it detects a great skill check. For best results, keep the minimum game **FPS 90** or above.
 
 The project uses PyTorch for training and ONNX Runtime for real-time inference, with CPU support (GPU is not mandatory). It demonstrates how computer vision models can operate within the latency constraints of a multiplayer game.
 
