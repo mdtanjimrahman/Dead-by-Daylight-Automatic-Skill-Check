@@ -1,0 +1,6 @@
+dearpygui 
+mss 
+numpy 
+Pillow 
+pynput 
+onnxruntime
